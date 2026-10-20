@@ -149,6 +149,8 @@ pub struct ProgramEntry {
     pub state: AppState,
     pub rules: Vec<usize>,
     pub inbound_allow: usize,
+    /// Part of Windows itself (under %WINDIR%, the System kernel, or only built-in rules).
+    pub windows: bool,
 }
 
 /// A service that is reachable from outside (e.g. "SMB, port 445") and the rules that open it.
@@ -509,13 +511,23 @@ pub fn analyze(rules: &[Rule]) -> Analysis {
             state: r.app_state,
             rules: Vec::new(),
             inbound_allow: 0,
+            // Starts true and stays true only while every rule is built-in.
+            windows: true,
         });
         entry.rules.push(i);
+        entry.windows &= r.builtin;
         if r.enabled && r.direction == Direction::In && r.action == Action::Allow {
             entry.inbound_allow += 1;
         }
     }
     let mut programs: Vec<ProgramEntry> = prog_map.into_values().collect();
+    let windir = format!("{}\\", std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into()).to_lowercase());
+    for p in programs.iter_mut() {
+        // cw5n1h2txyewy is the publisher ID of packages that ship with Windows itself.
+        p.windows |= p.state == AppState::System
+            || p.key.starts_with(&windir)
+            || (p.key.starts_with("pkg:") && p.key.ends_with("_cw5n1h2txyewy"));
+    }
     programs.sort_by(|a, b| {
         (b.state == AppState::Missing)
             .cmp(&(a.state == AppState::Missing))

@@ -114,6 +114,7 @@ pub struct App {
     port_sensitive_only: bool,
     program_search: String,
     program_missing_only: bool,
+    program_hide_windows: bool,
     selected: HashSet<String>,
     focused: Option<String>,
     sort: (SortCol, bool),
@@ -169,6 +170,7 @@ impl App {
             port_sensitive_only: false,
             program_search: String::new(),
             program_missing_only: false,
+            program_hide_windows: true,
             selected: HashSet::new(),
             focused: None,
             sort: (SortCol::Name, true),
@@ -2075,6 +2077,7 @@ impl App {
             .collect();
         ui.horizontal(|ui| {
             search_box(ui, &mut self.program_search, "Filter programs...", 260.0, "programs_search");
+            toggle_chip(ui, &mut self.program_hide_windows, "Hide Windows programs");
             toggle_chip(ui, &mut self.program_missing_only, "Only missing");
             if !missing.is_empty() {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2097,6 +2100,7 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(_, p)| !self.program_missing_only || p.state == AppState::Missing)
+            .filter(|(_, p)| !self.program_hide_windows || !p.windows)
             .filter(|(_, p)| q.is_empty() || p.label.to_lowercase().contains(&q))
             .map(|(i, _)| i)
             .collect();
@@ -2139,7 +2143,10 @@ impl App {
                             row.col(|ui| {
                                 ui.label(RichText::new(icon).color(color).size(16.0)).on_hover_text(tip);
                             });
-                            let name = if p.key.is_empty() || p.key.starts_with("pkg:") || p.key.starts_with("svc:") {
+                            let name = if let Some(pfn) = p.label.strip_prefix("App package ") {
+                                // "Microsoft.WindowsStore_8wekyb3d8bbwe" -> "Microsoft.WindowsStore"
+                                pfn.split('_').next().unwrap_or(pfn).to_string()
+                            } else if p.key.is_empty() || p.key.starts_with("svc:") {
                                 p.label.clone()
                             } else {
                                 file_name(&p.label).to_string()
