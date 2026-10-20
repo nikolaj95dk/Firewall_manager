@@ -10,7 +10,7 @@ use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as ph;
 use raw_window_handle::HasWindowHandle;
 
-use crate::analysis::{self, Analysis, Issue, IssueKind, Severity};
+use crate::analysis::{self, Analysis, ExposureGroup, Issue, IssueKind, Severity};
 use crate::firewall::{
     self, Action, AppState, Direction, NewRule, OpOutcome, PortSpec, ProfileStatus, Protocol, Rule, Snapshot, Source,
     PROFILE_DOMAIN, PROFILE_PRIVATE, PROFILE_PUBLIC,
@@ -26,6 +26,7 @@ use crate::theme::*;
 enum View {
     Overview,
     Rules,
+    Exposure,
     Cleanup,
     Ports,
     Programs,
@@ -120,6 +121,9 @@ pub struct App {
 
     toasts: Vec<Toast>,
     confirm_delete: Option<Vec<String>>,
+    /// "I understand" tick for deleting built-in rules in the confirm dialog.
+    delete_ack: bool,
+    expanded_exposure: HashSet<String>,
     create: Option<CreateForm>,
     reviewed: HashSet<String>,
     show_reviewed: bool,
@@ -160,7 +164,7 @@ impl App {
             rx,
             view: View::Overview,
             filters: Filters { hide_builtin: false, ..Default::default() },
-            cleanup_kind: IssueKind::ExposedPort,
+            cleanup_kind: IssueKind::MissingProgram,
             port_search: String::new(),
             port_sensitive_only: false,
             program_search: String::new(),
@@ -171,6 +175,8 @@ impl App {
             scroll_to_focus: false,
             toasts: Vec::new(),
             confirm_delete: None,
+            delete_ack: false,
+            expanded_exposure: HashSet::new(),
             create: None,
             reviewed,
             show_reviewed: false,
@@ -237,6 +243,17 @@ impl App {
         self.run_op(ctx, format!("Deleting {n} rule(s)..."), format!("Deleted {n} rule(s)"), true, move || {
             firewall::delete_rules(&ids)
         });
+    }
+
+    fn limit_to_local(&mut self, ctx: &egui::Context, ids: Vec<String>) {
+        let n = ids.len();
+        self.run_op(
+            ctx,
+            format!("Limiting {n} rule(s) to the local network..."),
+            format!("{n} rule(s) now only accept connections from your local network"),
+            true,
+            move || firewall::limit_to_local_subnet(&ids),
+        );
     }
 
     fn set_enabled(&mut self, ctx: &egui::Context, ids: Vec<String>, enabled: bool) {
@@ -364,6 +381,20 @@ impl App {
 
     fn count_kind(&self, kind: IssueKind) -> usize {
         (0..self.rules.len()).filter(|&i| self.issues(i).iter().any(|x| x.kind == kind)).count()
+    }
+
+    /// Rules with at least one junk finding (exposure findings excluded).
+    fn cleanup_count(&self) -> usize {
+        (0..self.rules.len()).filter(|&i| self.issues(i).iter().any(|x| !x.kind.is_exposure())).count()
+    }
+
+    /// An exposure is "accepted" once every rule behind it was marked as needed.
+    fn accepted(&self, g: &ExposureGroup) -> bool {
+        g.rules.iter().all(|&i| self.reviewed.contains(&self.rules[i].id))
+    }
+
+    fn open_exposures(&self) -> Vec<usize> {
+        (0..self.analysis.exposure.len()).filter(|&n| !self.accepted(&self.analysis.exposure[n])).collect()
     }
 
     fn focused_index(&self) -> Option<usize> {
@@ -740,6 +771,7 @@ impl eframe::App for App {
                 match self.view {
                     View::Overview => self.overview(ui),
                     View::Rules => self.rules_view(ui),
+                    View::Exposure => self.exposure_view(ui),
                     View::Cleanup => self.cleanup_view(ui),
                     View::Ports => self.ports_view(ui),
                     View::Programs => self.programs_view(ui),
@@ -806,13 +838,14 @@ impl App {
         });
         ui.add_space(22.0);
 
-        let attention = (0..self.rules.len())
-            .filter(|&i| self.issues(i).iter().any(|x| x.severity >= Severity::Low))
-            .count();
+        let open = self.open_exposures();
+        let exposure_color =
+            if open.iter().any(|&n| self.analysis.exposure[n].severity == Severity::High) { RED } else { AMBER };
         let nav = [
             (View::Overview, ph::SQUARES_FOUR, "Overview", None),
             (View::Rules, ph::LIST_BULLETS, "All rules", Some((self.rules.len(), TEXT_DIM))),
-            (View::Cleanup, ph::BROOM, "Cleanup", Some((attention, AMBER))),
+            (View::Exposure, ph::SHIELD_WARNING, "Exposure", Some((open.len(), exposure_color))),
+            (View::Cleanup, ph::BROOM, "Cleanup", Some((self.cleanup_count(), AMBER))),
             (View::Ports, ph::PLUGS, "Ports", Some((self.analysis.ports.len(), TEXT_DIM))),
             (View::Programs, ph::APP_WINDOW, "Programs", Some((self.analysis.programs.len(), TEXT_DIM))),
         ];
@@ -942,8 +975,10 @@ impl App {
             self.rules.iter().filter(|r| r.enabled && r.direction == Direction::In && r.action == Action::Allow).collect();
         let inbound_allow = inbound.len();
         let open_any = inbound.iter().filter(|r| r.remote_addrs.is_empty()).count();
-        let flagged = (0..total).filter(|&i| self.issues(i).iter().any(|x| x.severity >= Severity::Low)).count();
-        let high = (0..total).filter(|&i| self.max_severity(i) == Some(Severity::High)).count();
+        let open = self.open_exposures();
+        let high = open.iter().filter(|&&n| self.analysis.exposure[n].severity == Severity::High).count();
+        let accepted = self.analysis.exposure.len() - open.len();
+        let junk = self.cleanup_count();
         let missing_programs = self.analysis.programs.iter().filter(|p| p.state == AppState::Missing).count();
         let custom = self.rules.iter().filter(|r| !r.builtin).count();
 
@@ -959,13 +994,14 @@ impl App {
                     &format!("{open_any} open to any address")).clicked() {
                     go_inbound = true;
                 }
-                if stat_card(&mut cols[2], ph::BROOM, if high > 0 { RED } else { AMBER }, flagged.to_string(), "Rules to review",
-                    &format!("{high} high severity")).clicked() {
-                    go = Some(View::Cleanup);
+                let exposure_color = if high > 0 { RED } else if open.is_empty() { GREEN } else { AMBER };
+                if stat_card(&mut cols[2], ph::SHIELD_WARNING, exposure_color, open.len().to_string(), "Exposed services",
+                    &format!("{high} high risk · {accepted} accepted")).clicked() {
+                    go = Some(View::Exposure);
                 }
-                if stat_card(&mut cols[3], ph::APP_WINDOW, VIOLET, self.analysis.programs.len().to_string(), "Programs",
-                    &format!("{missing_programs} no longer installed")).clicked() {
-                    go = Some(View::Programs);
+                if stat_card(&mut cols[3], ph::BROOM, if junk > 0 { AMBER } else { GREEN }, junk.to_string(), "Junk rules",
+                    &format!("{missing_programs} programs no longer installed")).clicked() {
+                    go = Some(View::Cleanup);
                 }
             });
             if go_inbound {
@@ -984,48 +1020,50 @@ impl App {
             ui.add_space(12.0);
 
             ui.columns(2, |cols| {
-                self.attention_card(&mut cols[0]);
+                self.exposure_summary_card(&mut cols[0]);
                 self.cleanup_summary_card(&mut cols[1]);
-                cols[1].add_space(12.0);
-                self.exposed_ports_card(&mut cols[1]);
             });
         });
     }
 
-    fn attention_card(&mut self, ui: &mut Ui) {
-        let mut items: Vec<(usize, Issue)> = (0..self.rules.len())
-            .flat_map(|i| self.issues(i).iter().filter(|x| x.severity >= Severity::Medium).map(move |x| (i, x.clone())))
-            .collect();
-        items.sort_by(|a, b| b.1.severity.cmp(&a.1.severity).then(self.rules[a.0].name.cmp(&self.rules[b.0].name)));
-        let total = items.len();
-        let mut clicked = None;
-        let mut show_more = false;
+    fn exposure_summary_card(&mut self, ui: &mut Ui) {
+        let open = self.open_exposures();
+        let mut clicked: Option<String> = None;
+        let mut go = false;
         card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(RichText::new(icon_text(ph::WARNING, "Needs attention")).family(semibold()).size(16.0));
+                ui.label(RichText::new(icon_text(ph::SHIELD_WARNING, "Exposed to the network")).family(semibold()).size(16.0));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    pill(ui, format!("{total}"), if total > 0 { AMBER } else { GREEN });
+                    pill(ui, open.len().to_string(), if open.is_empty() { GREEN } else { AMBER });
                 });
             });
+            ui.label(RichText::new("Services other devices can reach. Review, don't bulk delete.").color(TEXT_DIM).size(12.5));
             ui.add_space(6.0);
-            if items.is_empty() {
-                ui.label(RichText::new(icon_text(ph::SEAL_CHECK, "Nothing important found. Nice and tidy.")).color(GREEN));
+            if open.is_empty() {
+                ui.label(RichText::new(icon_text(ph::SEAL_CHECK, "Nothing left to review.")).color(GREEN));
                 return;
             }
-            for (i, issue) in items.iter().take(14) {
-                let r = &self.rules[*i];
+            for &n in open.iter().take(10) {
+                let g = &self.analysis.exposure[n];
+                let any = g.rules.iter().filter(|&&i| self.rules[i].remote_addrs.is_empty()).count();
+                let scope = if any > 0 { "open to any address" } else { "local network only" };
                 let resp = Frame::new()
                     .corner_radius(10)
                     .inner_margin(Margin::symmetric(10, 7))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(kind_icon(issue.kind)).color(severity_color(issue.severity)).size(16.0));
+                            ui.label(RichText::new(ph::PLUGS).color(severity_color(g.severity)).size(16.0));
                             ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing.y = 1.0;
-                                ui.add(egui::Label::new(RichText::new(&r.name).color(TEXT)).truncate());
-                                ui.add(egui::Label::new(RichText::new(&issue.detail).color(TEXT_DIM).size(12.5)).truncate());
+                                ui.label(RichText::new(format!("{}  ·  {}", g.title, g.subtitle)).color(TEXT));
+                                ui.label(
+                                    RichText::new(format!("{} rule(s) · {scope}", g.rules.len())).color(TEXT_DIM).size(12.5),
+                                );
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                pill(ui, g.severity.label(), severity_color(g.severity));
                             });
                         });
                     })
@@ -1035,30 +1073,28 @@ impl App {
                     ui.painter().rect_filled(resp.rect, CornerRadius::same(10), tint(Color32::WHITE, 7));
                 }
                 if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                    clicked = Some(*i);
+                    clicked = Some(g.key.clone());
                 }
             }
-            if total > 14 {
-                ui.add_space(4.0);
-                if ui.link(format!("and {} more in Cleanup", total - 14)).clicked() {
-                    show_more = true;
-                }
+            if open.len() > 10 && ui.link(format!("and {} more", open.len() - 10)).clicked() {
+                go = true;
             }
         });
-        if show_more {
-            self.view = View::Cleanup;
+        if let Some(key) = clicked {
+            self.expanded_exposure.insert(key);
+            go = true;
         }
-        if let Some(i) = clicked {
-            self.go_rules_with(|_| {});
-            self.focus_rule(i);
+        if go {
+            self.view = View::Exposure;
         }
     }
 
     fn cleanup_summary_card(&mut self, ui: &mut Ui) {
-        let counts: Vec<(IssueKind, usize)> = IssueKind::ALL.iter().map(|&k| (k, self.count_kind(k))).collect();
+        let counts: Vec<(IssueKind, usize)> = IssueKind::CLEANUP.iter().map(|&k| (k, self.count_kind(k))).collect();
         card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(icon_text(ph::BROOM, "Cleanup candidates")).family(semibold()).size(16.0));
+            ui.label(RichText::new(icon_text(ph::BROOM, "Junk rules")).family(semibold()).size(16.0));
+            ui.label(RichText::new("Rules that do nothing useful. Safe to remove.").color(TEXT_DIM).size(12.5));
             ui.add_space(6.0);
             for (kind, n) in counts {
                 let resp = ui
@@ -1066,7 +1102,6 @@ impl App {
                         ui.label(RichText::new(kind_icon(kind)).color(kind_color(kind)).size(15.0));
                         ui.label(RichText::new(kind.title()).color(if n > 0 { TEXT } else { TEXT_FAINT }));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(RichText::new(ph::CARET_UP).color(TEXT_FAINT).size(1.0)); // keeps row height stable
                             pill(ui, n.to_string(), if n > 0 { kind_color(kind) } else { TEXT_FAINT });
                         });
                     })
@@ -1080,44 +1115,215 @@ impl App {
         });
     }
 
-    fn exposed_ports_card(&mut self, ui: &mut Ui) {
-        let mut exposed: Vec<(usize, &analysis::PortEntry)> = self
-            .analysis
-            .ports
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| p.known.is_some() && p.inbound_allow > 0)
-            .collect();
-        exposed.sort_by(|a, b| b.1.known.unwrap().risk.cmp(&a.1.known.unwrap().risk).then(a.1.spec.cmp(&b.1.spec)));
-        let mut clicked = None;
-        card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(RichText::new(icon_text(ph::PLUGS, "Well-known ports open inbound")).family(semibold()).size(16.0));
-            ui.add_space(6.0);
-            if exposed.is_empty() {
-                ui.label(RichText::new("No sensitive ports are open inbound.").color(GREEN));
-                return;
+    // -----------------------------------------------------------------------------------------
+    // Exposure
+    // -----------------------------------------------------------------------------------------
+
+    fn exposure_view(&mut self, ui: &mut Ui) {
+        self.page_header(ui, "Exposure", "Things on this PC that other devices can connect to.");
+        let open = self.open_exposures();
+        let accepted: Vec<usize> = (0..self.analysis.exposure.len()).filter(|n| !open.contains(n)).collect();
+
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            Frame::new().fill(tint(ACCENT, 16)).corner_radius(12).inner_margin(Margin::same(12)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(icon_text(
+                            ph::INFO,
+                            "These rules are usually intentional, so nothing here can be deleted. For each one: limit it \
+                             to your local network, switch it off (reversible), or confirm you need it.",
+                        ))
+                        .color(TEXT),
+                    )
+                    .wrap(),
+                );
+            });
+            ui.add_space(12.0);
+
+            if open.is_empty() {
+                ui.label(RichText::new(icon_text(ph::SEAL_CHECK, "Nothing left to review.")).color(GREEN));
             }
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-                for (idx, p) in &exposed {
-                    let k = p.known.unwrap();
-                    let color = risk_color(k.risk);
-                    let text = format!("{} {} · {}", p.spec.label(), k.name, p.inbound_allow);
-                    let btn = egui::Button::new(RichText::new(text).size(13.0).color(color))
-                        .fill(tint(color, 24))
-                        .stroke(Stroke::new(1.0, tint(color, 60)))
-                        .corner_radius(14);
-                    if ui.add(btn).on_hover_text(format!("{} ({})\n{} enabled inbound allow rule(s)", k.why, p.protocol.label(), p.inbound_allow)).clicked() {
-                        clicked = Some(*idx);
+            for n in open {
+                self.exposure_card(ui, n, false);
+                ui.add_space(8.0);
+            }
+            if !accepted.is_empty() {
+                ui.add_space(10.0);
+                ui.label(RichText::new(format!("ACCEPTED ({})", accepted.len())).size(11.0).color(TEXT_FAINT));
+                ui.add_space(4.0);
+                for n in accepted {
+                    self.exposure_card(ui, n, true);
+                    ui.add_space(8.0);
+                }
+            }
+        });
+    }
+
+    fn exposure_card(&mut self, ui: &mut Ui, n: usize, accepted: bool) {
+        let g = &self.analysis.exposure[n];
+        let key = g.key.clone();
+        let rule_ids: Vec<String> = g.rules.iter().map(|&i| self.rules[i].id.clone()).collect();
+        let modifiable: Vec<usize> = g.rules.iter().copied().filter(|&i| self.rules[i].can_modify()).collect();
+        let open_any: Vec<String> =
+            modifiable.iter().filter(|&&i| self.rules[i].remote_addrs.is_empty()).map(|&i| self.rules[i].id.clone()).collect();
+        let to_disable: Vec<String> = modifiable.iter().map(|&i| self.rules[i].id.clone()).collect();
+        let any_count = g.rules.iter().filter(|&&i| self.rules[i].remote_addrs.is_empty()).count();
+        let profiles = g.rules.iter().fold(0u8, |acc, &i| acc | self.rules[i].profiles);
+        let expanded = self.expanded_exposure.contains(&key);
+        let color = if accepted { GREEN } else { severity_color(g.severity) };
+        let busy = self.busy.is_some();
+
+        let mut toggle_expand = false;
+        let mut limit = false;
+        let mut disable = false;
+        let mut accept: Option<bool> = None;
+        let mut open_rule: Option<usize> = None;
+
+        Frame::new()
+            .fill(SURFACE)
+            .stroke(Stroke::new(1.0, if accepted { BORDER } else { tint(color, 70) }))
+            .corner_radius(14)
+            .inner_margin(Margin::same(16))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let icon = if accepted { ph::CHECK_CIRCLE } else { ph::PLUGS };
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::hover());
+                    ui.painter().rect_filled(rect, CornerRadius::same(10), tint(color, 30));
+                    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon, FontId::proportional(18.0), color);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        ui.label(RichText::new(&g.title).family(semibold()).size(16.0).color(TEXT));
+                        ui.label(RichText::new(&g.subtitle).color(TEXT_DIM).size(12.5));
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if accepted {
+                            pill(ui, "Accepted", GREEN);
+                        } else {
+                            pill(ui, format!("{} risk", g.severity.label()), color);
+                        }
+                    });
+                });
+                if !accepted {
+                    ui.add_space(6.0);
+                    ui.add(egui::Label::new(RichText::new(&g.why).color(TEXT)).wrap());
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.label(RichText::new(format!("{} rule(s)", g.rules.len())).color(TEXT_DIM));
+                    ui.label(RichText::new("·").color(TEXT_FAINT));
+                    if any_count > 0 {
+                        ui.label(RichText::new(icon_text(ph::GLOBE, &format!("{any_count} open to any address"))).color(AMBER));
+                    } else {
+                        ui.label(RichText::new(icon_text(ph::HOUSE_LINE, "Local network only")).color(GREEN));
                     }
+                    ui.label(RichText::new("·").color(TEXT_FAINT));
+                    profile_pills(ui, profiles, false);
+                });
+                if let (Some(hint), false) = (g.hint, accepted) {
+                    ui.add_space(2.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(icon_text(ph::GEAR_SIX, &format!("Cleanest way to switch off: {hint}")))
+                                .color(TEXT_DIM)
+                                .size(12.5),
+                        )
+                        .wrap(),
+                    );
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    if !accepted {
+                        if !open_any.is_empty()
+                            && ui
+                                .add_enabled(!busy, primary_button(icon_text(ph::HOUSE_LINE, "Limit to local network")))
+                                .on_hover_text(
+                                    "Only devices on your own network (LocalSubnet) can connect.\nKeeps it working at home, \
+                                     closes it to everyone else.",
+                                )
+                                .clicked()
+                        {
+                            limit = true;
+                        }
+                        if !to_disable.is_empty()
+                            && ui
+                                .add_enabled(!busy, ghost_button(icon_text(ph::TOGGLE_LEFT, "Switch off")))
+                                .on_hover_text("Disables the rules. Can be turned back on any time.")
+                                .clicked()
+                        {
+                            disable = true;
+                        }
+                        if ui
+                            .add(ghost_button(icon_text(ph::THUMBS_UP, "I need this")))
+                            .on_hover_text("Keep as is and stop flagging it")
+                            .clicked()
+                        {
+                            accept = Some(true);
+                        }
+                    } else if ui.add(ghost_button(icon_text(ph::ARROWS_CLOCKWISE, "Review again"))).clicked() {
+                        accept = Some(false);
+                    }
+                    let caret = if expanded { ph::CARET_DOWN } else { ph::CARET_RIGHT };
+                    if ui
+                        .add(egui::Button::new(RichText::new(format!("{caret}  Show rules")).color(TEXT_DIM)).frame(false))
+                        .clicked()
+                    {
+                        toggle_expand = true;
+                    }
+                });
+                if modifiable.len() < g.rules.len() {
+                    ui.label(
+                        RichText::new("Some rules come from Group Policy and can't be changed here.").color(TEXT_FAINT).size(12.0),
+                    );
+                }
+
+                if expanded {
+                    ui.add_space(6.0);
+                    Frame::new().fill(BG).corner_radius(10).inner_margin(Margin::symmetric(10, 6)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        for &i in &g.rules {
+                            let r = &self.rules[i];
+                            let resp = ui
+                                .horizontal(|ui| {
+                                    dot(ui, if r.enabled { GREEN } else { TEXT_FAINT });
+                                    ui.add(egui::Label::new(RichText::new(&r.name).color(TEXT)).truncate());
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        ui.label(RichText::new(ph::CARET_RIGHT).color(TEXT_FAINT));
+                                        let c = if r.remote_addrs.is_empty() { AMBER } else { TEXT_DIM };
+                                        ui.label(RichText::new(r.remote_label()).color(c).size(12.5));
+                                        profile_pills(ui, r.profiles, false);
+                                    });
+                                })
+                                .response
+                                .interact(Sense::click())
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text("Open in All rules");
+                            if resp.clicked() {
+                                open_rule = Some(i);
+                            }
+                        }
+                    });
                 }
             });
-        });
-        if let Some(idx) = clicked {
-            let p = &self.analysis.ports[idx];
-            let key = (p.protocol, p.spec.clone());
-            self.go_rules_with(|f| f.port = Some(key));
+
+        let ctx = ui.ctx().clone();
+        if toggle_expand && !self.expanded_exposure.remove(&key) {
+            self.expanded_exposure.insert(key);
+        }
+        if limit {
+            self.limit_to_local(&ctx, open_any);
+        } else if disable {
+            self.set_enabled(&ctx, to_disable, false);
+        }
+        if let Some(v) = accept {
+            self.set_reviewed(&rule_ids, v);
+        }
+        if let Some(i) = open_rule {
+            self.go_rules_with(|_| {});
+            self.focus_rule(i);
         }
     }
 
@@ -1563,6 +1769,15 @@ impl App {
                 if ui.add_enabled(can, ghost_button(icon_text(icon, label))).clicked() {
                     self.set_enabled(ui.ctx(), vec![r.id.clone()], !r.enabled);
                 }
+                let open_inbound = r.enabled && r.direction == Direction::In && r.action == Action::Allow && r.remote_addrs.is_empty();
+                if open_inbound
+                    && ui
+                        .add_enabled(can, ghost_button(icon_text(ph::HOUSE_LINE, "Limit to local network")))
+                        .on_hover_text("Only devices on your own network (LocalSubnet) can connect")
+                        .clicked()
+                {
+                    self.limit_to_local(ui.ctx(), vec![r.id.clone()]);
+                }
                 if ui.add_enabled(can, danger_button(icon_text(ph::TRASH, "Delete"))).clicked() {
                     self.confirm_delete = Some(vec![r.id.clone()]);
                 }
@@ -1597,7 +1812,7 @@ impl App {
     // -----------------------------------------------------------------------------------------
 
     fn cleanup_view(&mut self, ui: &mut Ui) {
-        self.page_header(ui, "Cleanup", "Rules that are probably useless, redundant or more open than you think.");
+        self.page_header(ui, "Cleanup", "Rules that do nothing useful - safe to remove. Exposed services live under Exposure.");
 
         egui::SidePanel::left("cleanup_kinds")
             .exact_width(270.0)
@@ -1605,7 +1820,7 @@ impl App {
             .show_separator_line(false)
             .frame(Frame::new().inner_margin(Margin { left: 0, right: 16, top: 0, bottom: 0 }))
             .show_inside(ui, |ui| {
-                for kind in IssueKind::ALL {
+                for kind in IssueKind::CLEANUP {
                     let n = self.count_kind(kind);
                     let active = self.cleanup_kind == kind;
                     let color = kind_color(kind);
@@ -1936,7 +2151,10 @@ impl App {
         let Some(ids) = self.confirm_delete.clone() else { return };
         let mut close = false;
         let mut confirmed = false;
+        let mut disable_instead = false;
         let builtin = ids.iter().filter(|id| self.index.get(*id).is_some_and(|&i| self.rules[i].builtin)).count();
+        let all_builtin = builtin == ids.len();
+        let mut ack = self.delete_ack;
         let names: Vec<String> = ids.iter().filter_map(|id| self.index.get(id)).map(|&i| self.rules[i].name.clone()).collect();
 
         let modal = egui::Modal::new(egui::Id::new("confirm_delete")).frame(modal_frame()).show(ctx, |ui| {
@@ -1959,9 +2177,22 @@ impl App {
             });
             ui.add_space(6.0);
             if builtin > 0 {
-                ui.label(RichText::new(icon_text(ph::WARNING, &format!(
-                    "{builtin} of these are built-in Windows rules. Removing them can break Windows features; disabling is usually safer."
-                ))).color(AMBER));
+                Frame::new().fill(tint(AMBER, 22)).corner_radius(10).inner_margin(Margin::same(10)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    let which = if ids.len() == 1 {
+                        "This is a built-in Windows rule.".to_string()
+                    } else {
+                        format!("{builtin} of these are built-in Windows rules.")
+                    };
+                    ui.add(egui::Label::new(RichText::new(icon_text(ph::WARNING, &format!(
+                        "{which} Windows' own on/off switches (network discovery, \
+                         file sharing, ...) rely on them, and getting them back means resetting the whole firewall. \
+                         Disabling gives the same protection and can be undone."
+                    ))).color(AMBER)).wrap());
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut ack, RichText::new("I understand, delete the Windows rules anyway").color(TEXT));
+                });
+                ui.add_space(4.0);
             }
             if !self.backed_up {
                 ui.label(RichText::new(icon_text(ph::ARCHIVE, "A full backup of your firewall policy is saved first.")).color(TEXT_DIM));
@@ -1969,7 +2200,14 @@ impl App {
             ui.label(RichText::new("This cannot be undone from inside the app.").color(TEXT_DIM));
             ui.add_space(10.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.add(danger_button(icon_text(ph::TRASH, "Delete")).min_size(egui::vec2(96.0, 34.0))).clicked() {
+                let can_delete = builtin == 0 || ack;
+                if all_builtin {
+                    // The safe choice is the prominent one.
+                    if ui.add(primary_button(icon_text(ph::TOGGLE_LEFT, "Disable instead")).min_size(egui::vec2(130.0, 34.0))).clicked() {
+                        disable_instead = true;
+                    }
+                }
+                if ui.add_enabled(can_delete, danger_button(icon_text(ph::TRASH, "Delete")).min_size(egui::vec2(96.0, 34.0))).clicked() {
                     confirmed = true;
                 }
                 if ui.add(ghost_button("Cancel").min_size(egui::vec2(84.0, 34.0))).clicked() {
@@ -1977,17 +2215,21 @@ impl App {
                 }
             });
         });
+        self.delete_ack = ack;
         if modal.should_close() {
             close = true;
         }
-        if confirmed {
+        if confirmed || disable_instead || close {
             self.confirm_delete = None;
+            self.delete_ack = false;
+        }
+        if confirmed {
             for id in &ids {
                 self.selected.remove(id);
             }
             self.delete(ctx, ids);
-        } else if close {
-            self.confirm_delete = None;
+        } else if disable_instead {
+            self.set_enabled(ctx, ids, false);
         }
     }
 

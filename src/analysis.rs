@@ -55,6 +55,19 @@ impl IssueKind {
         IssueKind::Disabled,
     ];
 
+    /// Findings that are safe-to-remove junk (as opposed to exposure, which needs a human decision).
+    pub const CLEANUP: [IssueKind; 5] = [
+        IssueKind::MissingProgram,
+        IssueKind::Duplicate,
+        IssueKind::Covered,
+        IssueKind::SuspiciousPath,
+        IssueKind::Disabled,
+    ];
+
+    pub fn is_exposure(self) -> bool {
+        matches!(self, IssueKind::ExposedPort | IssueKind::BroadInbound)
+    }
+
     pub fn title(self) -> &'static str {
         match self {
             IssueKind::MissingProgram => "Program missing",
@@ -138,11 +151,24 @@ pub struct ProgramEntry {
     pub inbound_allow: usize,
 }
 
+/// A service that is reachable from outside (e.g. "SMB, port 445") and the rules that open it.
+pub struct ExposureGroup {
+    pub key: String,
+    pub title: String,
+    pub subtitle: String,
+    pub why: String,
+    /// Where Windows lets you switch this off properly, if anywhere.
+    pub hint: Option<&'static str>,
+    pub rules: Vec<usize>,
+    pub severity: Severity,
+}
+
 #[derive(Default)]
 pub struct Analysis {
     pub issues: Vec<Vec<Issue>>,
     pub ports: Vec<PortEntry>,
     pub programs: Vec<ProgramEntry>,
+    pub exposure: Vec<ExposureGroup>,
 }
 
 pub fn program_key(r: &Rule) -> String {
@@ -243,6 +269,7 @@ fn protocol_matches(proto: Protocol, k: &KnownPort) -> bool {
 
 pub fn analyze(rules: &[Rule]) -> Analysis {
     let mut issues: Vec<Vec<Issue>> = vec![Vec::new(); rules.len()];
+    let mut exposure: HashMap<String, ExposureGroup> = HashMap::new();
 
     // --- Per-rule checks -------------------------------------------------------------------
     for (i, r) in rules.iter().enumerate() {
@@ -300,6 +327,17 @@ pub fn analyze(rules: &[Rule]) -> Analysis {
                 },
                 related: None,
             });
+            add_exposure(&mut exposure, "broad".into(), i, sev, || ExposureGroup {
+                key: "broad".into(),
+                title: "All ports open".into(),
+                subtitle: "Any program".into(),
+                why: "Rules that aren't tied to a program or service and allow every port. This is effectively a \
+                      hole through the firewall."
+                    .into(),
+                hint: None,
+                rules: Vec::new(),
+                severity: sev,
+            });
         }
 
         if r.protocol.has_ports() {
@@ -334,6 +372,39 @@ pub fn analyze(rules: &[Rule]) -> Analysis {
                     detail: format!("Opens {} {scope}", parts.join(", ")),
                     related: None,
                 });
+
+                // One exposure card per service; a rule opening several shows up in each.
+                for k in &hits {
+                    let mut ksev = risk_severity(k.risk);
+                    if restricted {
+                        ksev = ksev.lower();
+                    }
+                    let key = format!("port:{}", k.port);
+                    add_exposure(&mut exposure, key.clone(), i, ksev, || ExposureGroup {
+                        key,
+                        title: k.name.into(),
+                        subtitle: format!("Port {} {}", k.port, r.protocol.label()),
+                        why: k.why.into(),
+                        hint: ports::windows_hint(k.port),
+                        rules: Vec::new(),
+                        severity: ksev,
+                    });
+                }
+                if let Some((a, b)) = wide {
+                    let wsev = if restricted { Severity::Low } else { Severity::Medium };
+                    let key = format!("range:{a}-{b}");
+                    add_exposure(&mut exposure, key.clone(), i, wsev, || ExposureGroup {
+                        key,
+                        title: "Wide port range".into(),
+                        subtitle: format!("Ports {a}-{b} {}", r.protocol.label()),
+                        why: "Opens a large block of ports at once. Usually only needed by a specific app (games, \
+                              VoIP, streaming)."
+                            .into(),
+                        hint: None,
+                        rules: Vec::new(),
+                        severity: wsev,
+                    });
+                }
             }
         }
     }
@@ -397,6 +468,9 @@ pub fn analyze(rules: &[Rule]) -> Analysis {
         list.sort_by(|a, b| b.severity.cmp(&a.severity));
     }
 
+    let mut exposure: Vec<ExposureGroup> = exposure.into_values().collect();
+    exposure.sort_by(|a, b| b.severity.cmp(&a.severity).then(a.title.cmp(&b.title)));
+
     // --- Port overview ------------------------------------------------------------------------
     let mut port_map: HashMap<(Protocol, PortSpec), Vec<usize>> = HashMap::new();
     for (i, r) in rules.iter().enumerate() {
@@ -444,7 +518,19 @@ pub fn analyze(rules: &[Rule]) -> Analysis {
             .then(a.label.cmp(&b.label))
     });
 
-    Analysis { issues, ports, programs }
+    Analysis { issues, ports, programs, exposure }
+}
+
+fn add_exposure(
+    map: &mut HashMap<String, ExposureGroup>,
+    key: String,
+    rule: usize,
+    severity: Severity,
+    make: impl FnOnce() -> ExposureGroup,
+) {
+    let g = map.entry(key).or_insert_with(make);
+    g.rules.push(rule);
+    g.severity = g.severity.max(severity);
 }
 
 #[cfg(test)]
@@ -549,5 +635,13 @@ mod tests {
         assert_eq!(sev(1), Some(Severity::Medium));
         assert_eq!(sev(3), None);
         assert!(kinds(&a, 2).contains(&IssueKind::BroadInbound));
+
+        // Both RDP rules land in one card, rated by the worst (unrestricted) one.
+        let rdp = a.exposure.iter().find(|g| g.key == "port:3389").unwrap();
+        assert_eq!(rdp.rules, vec![0, 1]);
+        assert_eq!(rdp.severity, Severity::High);
+        assert!(rdp.hint.is_some());
+        assert!(a.exposure.iter().any(|g| g.key == "broad" && g.rules == vec![2]));
+        assert!(!IssueKind::CLEANUP.iter().any(|k| k.is_exposure()));
     }
 }

@@ -594,6 +594,11 @@ pub fn set_enabled(ids: &[String], enabled: bool) -> OpOutcome {
     run_per_id(ids, &format!("Set-NetFirewallRule -Name $id -Enabled {flag}"))
 }
 
+/// Restricts who may connect to the local network only (remote address `LocalSubnet`).
+pub fn limit_to_local_subnet(ids: &[String]) -> OpOutcome {
+    run_per_id(ids, "Set-NetFirewallRule -Name $id -RemoteAddress LocalSubnet")
+}
+
 #[derive(Clone, Debug)]
 pub struct NewRule {
     pub name: String,

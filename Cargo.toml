@@ -1,6 +1,6 @@
 [package]
 name = "firewall-manager"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "A clean overview and cleanup tool for Windows Firewall rules"
 build = "build.rs"

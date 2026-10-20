@@ -69,6 +69,19 @@ pub const KNOWN_PORTS: &[KnownPort] = &[
     p(27017, true, false, "MongoDB", "Database exposed to the network", Critical),
 ];
 
+/// Where Windows lets you switch the feature behind a port off properly.
+pub fn windows_hint(port: u16) -> Option<&'static str> {
+    match port {
+        139 | 445 => Some("Settings > Network & internet > Advanced network settings > Advanced sharing settings > File and printer sharing"),
+        137 | 138 | 1900 | 3702 | 5355 | 5357 => {
+            Some("Settings > Network & internet > Advanced network settings > Advanced sharing settings > Network discovery")
+        }
+        3389 => Some("Settings > System > Remote Desktop"),
+        5985 | 5986 => Some("Run Disable-PSRemoting in an admin PowerShell"),
+        _ => None,
+    }
+}
+
 pub fn lookup(port: u16) -> Option<&'static KnownPort> {
     KNOWN_PORTS.iter().find(|k| k.port == port)
 }
