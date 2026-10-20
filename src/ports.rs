@@ -82,6 +82,17 @@ pub fn windows_hint(port: u16) -> Option<&'static str> {
     }
 }
 
+/// Recommendation shown on the Exposure card, for services where the right call isn't obvious.
+pub fn advice(port: u16) -> Option<&'static str> {
+    match port {
+        5353 => Some(
+            "Click \"I need this\". Browsers use mDNS to find Chromecasts, printers and TVs. It never leaves your \
+             network, so limiting it changes little. On public Wi-Fi, set the network to Public.",
+        ),
+        _ => None,
+    }
+}
+
 pub fn lookup(port: u16) -> Option<&'static KnownPort> {
     KNOWN_PORTS.iter().find(|k| k.port == port)
 }

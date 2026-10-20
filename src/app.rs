@@ -393,8 +393,13 @@ impl App {
         g.rules.iter().all(|&i| self.reviewed.contains(&self.rules[i].id))
     }
 
+    /// Handled = accepted, or every rule behind it already limited to specific addresses (e.g. LocalSubnet).
+    fn handled(&self, g: &ExposureGroup) -> bool {
+        self.accepted(g) || g.rules.iter().all(|&i| !self.rules[i].remote_addrs.is_empty())
+    }
+
     fn open_exposures(&self) -> Vec<usize> {
-        (0..self.analysis.exposure.len()).filter(|&n| !self.accepted(&self.analysis.exposure[n])).collect()
+        (0..self.analysis.exposure.len()).filter(|&n| !self.handled(&self.analysis.exposure[n])).collect()
     }
 
     fn focused_index(&self) -> Option<usize> {
@@ -977,7 +982,7 @@ impl App {
         let open_any = inbound.iter().filter(|r| r.remote_addrs.is_empty()).count();
         let open = self.open_exposures();
         let high = open.iter().filter(|&&n| self.analysis.exposure[n].severity == Severity::High).count();
-        let accepted = self.analysis.exposure.len() - open.len();
+        let handled = self.analysis.exposure.len() - open.len();
         let junk = self.cleanup_count();
         let missing_programs = self.analysis.programs.iter().filter(|p| p.state == AppState::Missing).count();
         let custom = self.rules.iter().filter(|r| !r.builtin).count();
@@ -996,7 +1001,7 @@ impl App {
                 }
                 let exposure_color = if high > 0 { RED } else if open.is_empty() { GREEN } else { AMBER };
                 if stat_card(&mut cols[2], ph::SHIELD_WARNING, exposure_color, open.len().to_string(), "Exposed services",
-                    &format!("{high} high risk · {accepted} accepted")).clicked() {
+                    &format!("{high} high risk · {handled} handled")).clicked() {
                     go = Some(View::Exposure);
                 }
                 if stat_card(&mut cols[3], ph::BROOM, if junk > 0 { AMBER } else { GREEN }, junk.to_string(), "Junk rules",
@@ -1122,7 +1127,7 @@ impl App {
     fn exposure_view(&mut self, ui: &mut Ui) {
         self.page_header(ui, "Exposure", "Things on this PC that other devices can connect to.");
         let open = self.open_exposures();
-        let accepted: Vec<usize> = (0..self.analysis.exposure.len()).filter(|n| !open.contains(n)).collect();
+        let handled: Vec<usize> = (0..self.analysis.exposure.len()).filter(|n| !open.contains(n)).collect();
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             Frame::new().fill(tint(ACCENT, 16)).corner_radius(12).inner_margin(Margin::same(12)).show(ui, |ui| {
@@ -1148,11 +1153,12 @@ impl App {
                 self.exposure_card(ui, n, false);
                 ui.add_space(8.0);
             }
-            if !accepted.is_empty() {
+            if !handled.is_empty() {
                 ui.add_space(10.0);
-                ui.label(RichText::new(format!("ACCEPTED ({})", accepted.len())).size(11.0).color(TEXT_FAINT));
+                ui.label(RichText::new(format!("HANDLED ({})", handled.len())).size(11.0).color(TEXT_FAINT));
+                ui.label(RichText::new("Limited to your local network, or marked as needed.").size(12.0).color(TEXT_FAINT));
                 ui.add_space(4.0);
-                for n in accepted {
+                for n in handled {
                     self.exposure_card(ui, n, true);
                     ui.add_space(8.0);
                 }
@@ -1160,7 +1166,7 @@ impl App {
         });
     }
 
-    fn exposure_card(&mut self, ui: &mut Ui, n: usize, accepted: bool) {
+    fn exposure_card(&mut self, ui: &mut Ui, n: usize, handled: bool) {
         let g = &self.analysis.exposure[n];
         let key = g.key.clone();
         let rule_ids: Vec<String> = g.rules.iter().map(|&i| self.rules[i].id.clone()).collect();
@@ -1171,7 +1177,8 @@ impl App {
         let any_count = g.rules.iter().filter(|&&i| self.rules[i].remote_addrs.is_empty()).count();
         let profiles = g.rules.iter().fold(0u8, |acc, &i| acc | self.rules[i].profiles);
         let expanded = self.expanded_exposure.contains(&key);
-        let color = if accepted { GREEN } else { severity_color(g.severity) };
+        let is_accepted = self.accepted(g);
+        let color = if handled { GREEN } else { severity_color(g.severity) };
         let busy = self.busy.is_some();
 
         let mut toggle_expand = false;
@@ -1182,13 +1189,17 @@ impl App {
 
         Frame::new()
             .fill(SURFACE)
-            .stroke(Stroke::new(1.0, if accepted { BORDER } else { tint(color, 70) }))
+            .stroke(Stroke::new(1.0, if handled { BORDER } else { tint(color, 70) }))
             .corner_radius(14)
             .inner_margin(Margin::same(16))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    let icon = if accepted { ph::CHECK_CIRCLE } else { ph::PLUGS };
+                    let icon = match (handled, is_accepted) {
+                        (false, _) => ph::PLUGS,
+                        (true, true) => ph::CHECK_CIRCLE,
+                        (true, false) => ph::HOUSE_LINE,
+                    };
                     let (rect, _) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::hover());
                     ui.painter().rect_filled(rect, CornerRadius::same(10), tint(color, 30));
                     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon, FontId::proportional(18.0), color);
@@ -1198,16 +1209,31 @@ impl App {
                         ui.label(RichText::new(&g.subtitle).color(TEXT_DIM).size(12.5));
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if accepted {
+                        if is_accepted {
                             pill(ui, "Accepted", GREEN);
+                        } else if handled {
+                            pill(ui, "Local network only", GREEN);
                         } else {
                             pill(ui, format!("{} risk", g.severity.label()), color);
                         }
                     });
                 });
-                if !accepted {
+                if !handled {
                     ui.add_space(6.0);
                     ui.add(egui::Label::new(RichText::new(&g.why).color(TEXT)).wrap());
+                    if let Some(advice) = g.advice {
+                        ui.add_space(6.0);
+                        Frame::new()
+                            .fill(tint(ACCENT, 18))
+                            .stroke(Stroke::new(1.0, tint(ACCENT, 60)))
+                            .corner_radius(10)
+                            .inner_margin(Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.label(RichText::new(icon_text(ph::LIGHTBULB, "Recommendation")).family(semibold()).color(ACCENT));
+                                ui.add(egui::Label::new(RichText::new(advice).color(TEXT)).wrap());
+                            });
+                    }
                 }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -1222,7 +1248,7 @@ impl App {
                     ui.label(RichText::new("·").color(TEXT_FAINT));
                     profile_pills(ui, profiles, false);
                 });
-                if let (Some(hint), false) = (g.hint, accepted) {
+                if let (Some(hint), false) = (g.hint, handled) {
                     ui.add_space(2.0);
                     ui.add(
                         egui::Label::new(
@@ -1236,7 +1262,7 @@ impl App {
 
                 ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
-                    if !accepted {
+                    if !handled {
                         if !open_any.is_empty()
                             && ui
                                 .add_enabled(!busy, primary_button(icon_text(ph::HOUSE_LINE, "Limit to local network")))
@@ -1263,8 +1289,17 @@ impl App {
                         {
                             accept = Some(true);
                         }
-                    } else if ui.add(ghost_button(icon_text(ph::ARROWS_CLOCKWISE, "Review again"))).clicked() {
-                        accept = Some(false);
+                    } else if is_accepted {
+                        if ui.add(ghost_button(icon_text(ph::ARROWS_CLOCKWISE, "Review again"))).clicked() {
+                            accept = Some(false);
+                        }
+                    } else if !to_disable.is_empty()
+                        && ui
+                            .add_enabled(!busy, ghost_button(icon_text(ph::TOGGLE_LEFT, "Switch off")))
+                            .on_hover_text("Disables the rules. Can be turned back on any time.")
+                            .clicked()
+                    {
+                        disable = true;
                     }
                     let caret = if expanded { ph::CARET_DOWN } else { ph::CARET_RIGHT };
                     if ui

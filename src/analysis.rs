@@ -159,6 +159,8 @@ pub struct ExposureGroup {
     pub why: String,
     /// Where Windows lets you switch this off properly, if anywhere.
     pub hint: Option<&'static str>,
+    /// Plain-language recommendation for what to do with this service, if we have one.
+    pub advice: Option<&'static str>,
     pub rules: Vec<usize>,
     pub severity: Severity,
 }
@@ -335,6 +337,7 @@ pub fn analyze(rules: &[Rule]) -> Analysis {
                       hole through the firewall."
                     .into(),
                 hint: None,
+                advice: None,
                 rules: Vec::new(),
                 severity: sev,
             });
@@ -386,6 +389,7 @@ pub fn analyze(rules: &[Rule]) -> Analysis {
                         subtitle: format!("Port {} {}", k.port, r.protocol.label()),
                         why: k.why.into(),
                         hint: ports::windows_hint(k.port),
+                        advice: ports::advice(k.port),
                         rules: Vec::new(),
                         severity: ksev,
                     });
@@ -401,6 +405,7 @@ pub fn analyze(rules: &[Rule]) -> Analysis {
                               VoIP, streaming)."
                             .into(),
                         hint: None,
+                        advice: None,
                         rules: Vec::new(),
                         severity: wsev,
                     });
@@ -641,6 +646,8 @@ mod tests {
         assert_eq!(rdp.rules, vec![0, 1]);
         assert_eq!(rdp.severity, Severity::High);
         assert!(rdp.hint.is_some());
+        assert!(rdp.advice.is_none());
+        assert!(crate::ports::advice(5353).is_some());
         assert!(a.exposure.iter().any(|g| g.key == "broad" && g.rules == vec![2]));
         assert!(!IssueKind::CLEANUP.iter().any(|k| k.is_exposure()));
     }
