@@ -1,12 +1,28 @@
 # Firewall Manager
 
-A clean, dark-themed overview of your Windows Firewall rules, made for tidying up years of
-"Allow access?" prompts and finding the rules that actually matter.
+**See what your Windows Firewall actually lets in, and clean up years of "Allow access?" leftovers.**
 
-The built-in *Windows Defender Firewall with Advanced Security* console shows hundreds of rules in one
-flat list. Firewall Manager groups them, explains them and points out what's junk and what's exposed.
+![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D4)
+![Rust](https://img.shields.io/badge/built%20with-Rust-orange)
+[![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue)](LICENSE)
+
+The built-in *Windows Defender Firewall with Advanced Security* console dumps hundreds of rules into one
+flat list. Firewall Manager groups them, explains them in plain language and points out two things:
+**what other devices can reach** on your PC, and **which rules are junk** you can safely delete.
 
 ![Overview](docs/overview.png)
+
+## Quick start
+
+1. Download the latest `FirewallManager_v<version>.exe` from
+   [Releases](https://github.com/nikolaj95dk/Firewall_manager/releases), or [build it yourself](#building).
+2. Run it and accept the UAC prompt. Changing firewall rules requires administrator rights.
+3. Start on **Exposure**, then **Cleanup**. A full backup is taken automatically before the first change.
+
+It's a single portable `.exe`. No installer, no service, nothing running in the background.
+
+> The exe is not code-signed, so Windows SmartScreen may warn on first launch.
+> Choose *More info* → *Run anyway*, or build from source.
 
 ## Features
 
@@ -32,7 +48,8 @@ flat list. Firewall Manager groups them, explains them and points out what's jun
   highlighted by risk, and bulk enable / disable / delete.
 - **Ports.** Every port referenced by any rule, how many rules cover it and whether it's open
   inbound.
-- **Programs.** Rules grouped per program, with programs that no longer exist listed first.
+- **Programs.** Rules grouped per program, with programs that no longer exist listed first. Windows'
+  own programs are hidden by default so your installed apps stand out.
 - **New rule / Duplicate as new.** A simple form with a program picker and a warning when you're
   about to open a sensitive port.
 
@@ -57,10 +74,10 @@ The app is built so you can't easily shoot yourself in the foot:
 
 ### Restoring a backup
 
-From an elevated prompt:
+From an elevated PowerShell prompt:
 
 ```powershell
-netsh advfirewall import "C:\Users\<you>\AppData\Local\FirewallManager\backups\firewall-<date>.wfw"
+netsh advfirewall import "$env:LOCALAPPDATA\FirewallManager\backups\firewall-<date>.wfw"
 ```
 
 > **Note:** importing replaces the *entire* firewall policy with the backup.
@@ -75,6 +92,8 @@ cargo build --release
 
 The exe lands in `target\release\FirewallManager.exe`. It embeds its icon and a manifest that
 requests administrator rights, so Windows shows a UAC prompt on launch.
+
+Or run `build.cmd`, which builds a release and copies it to `dist\FirewallManager_v<version>.exe`.
 
 > `cargo run` from a non-elevated terminal fails with error 740 because of the manifest. Run it from
 > an elevated terminal, or start the built exe directly.
@@ -124,3 +143,7 @@ rules you marked as reviewed or accepted.
 | `F5` | Reload |
 | `Del` | Delete selected rules (with confirmation) |
 | `Esc` | Close details / clear selection |
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).
