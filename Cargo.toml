@@ -1,6 +1,6 @@
 [package]
 name = "firewall-manager"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2021"
 description = "A clean overview and cleanup tool for Windows Firewall rules"
 license = "GPL-3.0-or-later"

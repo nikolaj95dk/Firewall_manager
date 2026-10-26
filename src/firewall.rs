@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use windows::core::{BSTR, PCWSTR};
 use windows::Win32::Foundation::{VARIANT_FALSE, VARIANT_TRUE};
@@ -527,38 +527,46 @@ pub struct OpOutcome {
     pub errors: Vec<String>,
 }
 
-fn ps_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
-}
-
-/// Runs `cmd` (a PowerShell command using `$id`) once per rule ID in a single PowerShell process.
+/// Runs `cmd` (a fixed PowerShell command using `$id`) once per rule ID in a single PowerShell process.
+///
+/// The IDs are sent as data on stdin, one per line, never pasted into the script: an ID can't
+/// break out into code, whatever quotes it contains. The script goes on the command line rather
+/// than into a temp file, so nothing else can swap it before the elevated PowerShell runs it.
+/// The script avoids double quotes, which powershell.exe strips from `-Command` arguments.
 fn run_per_id(ids: &[String], cmd: &str) -> OpOutcome {
-    let list = ids.iter().map(|id| ps_quote(id)).collect::<Vec<_>>().join(",\n");
-    let script = format!(
-        "[Console]::OutputEncoding = [Text.Encoding]::UTF8\n\
-         $ErrorActionPreference = 'Stop'\n\
-         $ProgressPreference = 'SilentlyContinue'\n\
-         foreach ($id in @(\n{list}\n)) {{\n\
-           try {{ {cmd}; \"OK|$id\" }} catch {{ \"ERR|$id|$($_.Exception.Message)\" }}\n\
-         }}\n"
-    );
-    let path = std::env::temp_dir().join(format!("fwmgr-{}-{}.ps1", std::process::id(), unique_suffix()));
-    let write = std::fs::File::create(&path).and_then(|mut f| {
-        // UTF-8 BOM so Windows PowerShell 5.1 reads non-ASCII IDs correctly.
-        f.write_all(b"\xEF\xBB\xBF")?;
-        f.write_all(script.as_bytes())
-    });
-    if let Err(e) = write {
-        return OpOutcome { ok: 0, errors: vec![format!("Could not write temp script: {e}")] };
-    }
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
-        .arg(&path)
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    let _ = std::fs::remove_file(&path);
-
     let mut outcome = OpOutcome::default();
+    let (ids, bad): (Vec<&String>, Vec<&String>) = ids.iter().partition(|id| !id.contains(['\r', '\n']));
+    outcome.errors.extend(bad.iter().map(|id| format!("{}: rule ID contains a line break", id.escape_debug())));
+    if ids.is_empty() {
+        return outcome;
+    }
+    let script = format!(
+        "[Console]::OutputEncoding = [Text.Encoding]::UTF8; \
+         $ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
+         $in = New-Object IO.StreamReader([Console]::OpenStandardInput(), (New-Object Text.UTF8Encoding $false)); \
+         while ($null -ne ($id = $in.ReadLine())) {{ \
+           if ($id) {{ try {{ {cmd}; 'OK|' + $id }} catch {{ 'ERR|' + $id + '|' + $_.Exception.Message }} }} \
+         }}"
+    );
+    let input: String = ids.iter().map(|id| format!("{id}\n")).collect();
+    let child = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command"])
+        .arg(&script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
+    let output = child.and_then(|mut child| {
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        // Written from another thread so a full stdout pipe can't deadlock a long ID list.
+        let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+        let output = child.wait_with_output();
+        let _ = writer.join();
+        output
+    });
+
     match output {
         Ok(out) => {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
@@ -576,13 +584,6 @@ fn run_per_id(ids: &[String], cmd: &str) -> OpOutcome {
         Err(e) => outcome.errors.push(format!("Could not start PowerShell: {e}")),
     }
     outcome
-}
-
-fn unique_suffix() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
 }
 
 pub fn delete_rules(ids: &[String]) -> OpOutcome {
@@ -768,6 +769,28 @@ mod tests {
 
     fn parse(data: &str) -> Rule {
         parse_rule("TEST-ID", data, Source::Local, &mut Resolver { cache: HashMap::new(), packages: None })
+    }
+
+    #[test]
+    fn rule_ids_reach_powershell_as_data() {
+        // Each ID must arrive unchanged and none may run as code: an escape would change the message.
+        let ids: Vec<String> = [
+            "plain-id",
+            "'; throw 'escaped'; '",
+            "\u{2019}; throw 'escaped'; \u{2018}",
+            "\"; throw \"escaped\"; \"",
+            "$(throw 'escaped')",
+            "{Ünïcode-规则}",
+        ]
+        .map(String::from)
+        .into();
+        let out = run_per_id(&ids, "throw 'seen'");
+        assert_eq!(out.ok, 0);
+        assert_eq!(out.errors, ids.iter().map(|id| format!("{id}: seen")).collect::<Vec<_>>());
+
+        let out = run_per_id(&["ok-id".into(), "bad\nid".into()], "$null = $id");
+        assert_eq!(out.ok, 1);
+        assert_eq!(out.errors, vec!["bad\\nid: rule ID contains a line break".to_string()]);
     }
 
     #[test]
